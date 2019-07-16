@@ -1,0 +1,240 @@
+from .base import BaseModel
+import torch
+import torch.nn as nn
+import numpy as np
+
+import math
+import torch.nn.functional as F
+from torch.nn.parameter import Parameter
+import pdb
+from ..rnn import SimpleEcho
+from ..rnn import DMCell
+
+
+cuda = torch.cuda.is_available()
+
+if cuda:
+	device = torch.device('cuda')
+else:
+	device = torch.device('cpu')
+
+class ConvInpEcho1(BaseModel):
+	"""
+	This Echo1 model can be trianed with decision making network or liner readout.
+	dm_dict: when None, a liner readout is used.
+
+	No ForceLearning is used!
+
+	BPTT is used,
+
+	(conv2d input)
+	|	   |     |
+	|----->|---->|(echo network)
+	|      |     |
+				 |
+	the output aggregate the identity mapping and echo network output.
+
+	"""
+
+	def __init__(self,inp_dim,
+				 n_echo,
+				 n_dm,
+				 echo_dict,
+				 bias_value=0.,
+				 input_scale=1.,
+				 input_sigma=1.,
+				 dm_dict=None):
+
+		super().__init__()
+		if isinstance(inp_dim,tuple):
+			self.inp_dim = inp_dim
+		elif isinstance(inp_dim,int):
+			self.inp_dim = (inp_dim,inp_dim)
+		else:
+			raise ValueError("inp_dim should be int or tuple")
+
+		self.n_inp = np.prod(self.inp_dim)
+		self.n_echo = n_echo
+		self.n_dm = n_dm
+		self.bias_value = bias_value
+		self.input_sigma = input_sigma
+		self.input_scale = input_scale
+		self.dm_dict = dm_dict
+		# self.identity_scale = identity_scale
+
+		self.conv_inp = nn.Conv2d(in_channels=1,
+								  out_channels=self.n_inp,
+								  kernel_size=self.inp_dim,
+								  stride=1)
+
+		self.simple_echo = SimpleEcho(inp_num=self.n_inp,
+									  hid_num=n_echo,
+									  **echo_dict)
+		if dm_dict is None:
+			self.linear = nn.Linear(self.n_echo,self.n_dm,bias=True)
+			self.criterion = nn.CrossEntropyLoss()
+		else:
+			self.dm = DMCell(inp_num=n_echo,
+						 hid_num=n_dm,
+						 **dm_dict)
+			self.criterion = nn.MSELoss()
+
+		self.init_weights()
+
+	@property
+	def with_dm(self):
+		return self.dm_dict != None
+
+	def init_weights(self):
+		## init conv_inp weights and bias
+		X,Y = np.meshgrid(np.arange(-self.inp_dim[0],self.inp_dim[0]+1),
+									 range(-self.inp_dim[1],self.inp_dim[1]+1))
+		matrix = np.exp(-(X**2+Y**2)/2.0/self.input_sigma**2)*self.input_scale
+		matrix = matrix.reshape(2*self.inp_dim[0]+1,2*self.inp_dim[1]+1)
+		# self.conv_inp.weight, [out_channels,in_channels,w,h]
+
+		for xi in range(self.inp_dim[0]):
+			for yi in range(self.inp_dim[1]):
+				self.conv_inp.weight.data[xi*self.inp_dim[1]+yi]= \
+				   torch.FloatTensor(matrix[self.inp_dim[0]-xi:2*self.inp_dim[0]-xi,self.inp_dim[1]-yi:2*self.inp_dim[1]-yi].reshape((1,)+self.inp_dim))
+
+		self.conv_inp.bias.data = torch.ones_like(self.conv_inp.bias.data)*self.bias_value
+
+		import matplotlib
+		matplotlib.use("Agg")
+		import matplotlib.pyplot as plt
+		plt.figure()
+		plt.imshow(self.conv_inp.weight.data[800].reshape(40,40).cpu().numpy())
+		plt.colorbar()
+		plt.savefig("matrix_weight_{}_{}.png".format(self.input_scale,self.input_sigma))
+
+		self.simple_echo.init_weights()
+		if self.with_dm:
+			self.dm.init_weights()
+		else:
+			stdv = 1.0 / math.sqrt(self.n_echo)
+			self.linear.weight.data = torch.FloatTensor(
+							 np.random.uniform(-stdv,stdv,size=(self.n_dm,self.n_echo)))
+			self.linear.bias.data = torch.zeros((self.n_dm))
+
+
+	def init_states(self,batch_size):
+		if self.with_dm:
+			self.u_echo = torch.zeros((batch_size,self.n_echo)).to(device)
+			self.h_echo = torch.zeros((batch_size,self.n_echo)).to(device)
+			self.s_dm = torch.zeros(batch_size,self.n_dm).to(device)
+		else:
+			self.u_echo = torch.zeros((batch_size,self.n_echo)).to(device)
+			self.h_echo = torch.zeros((batch_size,self.n_echo)).to(device)
+
+	def forward_train(self,x):
+		"""
+		x, a tuple, (X,Y)
+		   X, an input sequence. [batch,T,features]
+		   Y, a target label, long tensor. [batch,] or [batch,T]
+		"""
+		assert len(x) == 2
+		inp_x, inp_y = x
+		inp_x = inp_x.to(device)
+		inp_y = inp_y.to(device)
+		batch, T, _ = inp_x.shape
+		self.init_states(batch)
+
+		echo_states = []
+		dm_states = []
+		loss = 0
+
+		rr = torch.zeros((batch,self.n_dm)).to(device)
+		hh = torch.zeros((batch,self.n_echo)).to(device)
+		if self.with_dm:
+			for i in range(T):
+				input_echo = self.conv_inp(inp_x[:,i].reshape((-1,1)+self.inp_dim))
+				self.h_echo, (self.u_echo,_) = self.simple_echo(input_echo.reshape(-1,self.n_inp),(self.u_echo,self.h_echo))
+				r,(self.s_dm,) = self.dm(self.h_echo,(self.s_dm,))
+				loss += self.criterion(r, inp_y[:,i])
+
+				rr.copy_(r)
+				dm_states.append(rr.cpu().detach().numpy())
+
+				hh.copy_(self.h_echo)
+				echo_states.append(hh.cpu().detach().numpy())
+		else:
+			inp_y = inp_y.reshape(-1)
+			rx_mean = 0
+			for i in np.arange(T):
+				input_echo = self.conv_inp(inp_x[:,i].reshape((-1,1)+self.inp_dim))
+				self.h_echo, (self.u_echo,_) = self.simple_echo(input_echo.reshape(-1,self.n_inp),(self.u_echo,self.h_echo))
+				r = self.linear(self.h_echo)
+				rx_mean = rx_mean + r/T
+
+				rr.copy_(r)
+				dm_states.append(rr.cpu().detach().numpy())
+
+				hh.copy_(self.h_echo)
+				echo_states.append(hh.cpu().detach().numpy())
+
+			loss += self.criterion(rx_mean, inp_y)
+		print("loss is ",loss.cpu().item())
+		outputs = dict(
+					 loss = loss,
+					 echo_states = echo_states,
+					 outputs = dm_states
+					  )
+		return outputs
+
+
+	def forward_test(self,x):
+		"""
+		x, a tuple, (X,Y)
+		   X, an input sequence. [batch,T,features]
+		   Y, a target label, long tensor. [batch,] or [batch,T]
+		"""
+		assert len(x) == 2
+		inp_x, inp_y = x
+		inp_x = inp_x.to(device)
+		batch, T, _ = inp_x.shape
+		self.init_states(batch)
+
+		echo_states = []
+		dm_states = []
+
+		hh = torch.zeros((batch,self.n_echo)).to(device)
+		rr = torch.zeros((batch,self.n_dm)).to(device)
+		if self.with_dm:
+			for i in range(T):
+				input_echo = self.conv_inp(inp_x[:,i].reshape((-1,1)+self.inp_dim))
+				self.h_echo, (self.u_echo,_) = self.simple_echo(input_echo.reshape(-1,self.n_inp),(self.u_echo,self.h_echo))
+				r,(self.s_dm,) = self.dm(self.h_echo,(self.s_dm,))
+
+				rr.copy_(r)
+				dm_states.append(rr.cpu().detach().numpy())
+
+				hh.copy_(self.h_echo)
+				echo_states.append(hh.cpu().detach().numpy())
+			dm_states = np.array(dm_states).reshape(T,batch,-1)
+			inp_y = inp_y[:,-1].cpu().numpy().argmax(axis=-1)
+		else:
+			for i in np.arange(T):
+				input_echo = self.conv_inp(inp_x[:,i].reshape((-1,1)+self.inp_dim))
+				self.h_echo, (self.u_echo,_) = self.simple_echo(input_echo.reshape(-1,self.n_inp),(self.u_echo,self.h_echo))
+				r = self.linear(self.h_echo)
+
+				rr.copy_(r)
+				dm_states.append(rr.cpu().detach().numpy())
+
+				hh.copy_(self.h_echo)
+				echo_states.append(hh.cpu().detach().numpy())
+
+			dm_states = np.array(dm_states).reshape(T,batch,-1)
+			inp_y = inp_y.view(-1).cpu().numpy()
+
+		outputs = dict(
+					 echo_states = echo_states,
+					 outputs = dm_states,
+					 labels = inp_y
+					  )
+		return outputs
+
+
+
+##
