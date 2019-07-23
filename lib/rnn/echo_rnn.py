@@ -71,6 +71,22 @@ class SimpleEcho(nn.Module):
 			self.win.data = torch.FloatTensor(win)
 			self.win.requires_grad = False
 
+		if self.init_mode == "mode_c":
+			wr = np.random.rand(self.hid_num,self.hid_num) - 0.5
+			wr[np.random.rand(*wr.shape)>self.spars_p]=0.
+			M = np.eye(self.hid_num)*(1.-self.alpha) + wr*self.alpha
+			radius = np.max(np.abs(np.linalg.eigvals(wr)))
+			wr = wr/(radius-1.+self.alpha)*(self.scale-1.+self.alpha)
+			self.wr.data = torch.FloatTensor(wr)
+			self.wr.requires_grad = False
+
+			# win = np.random.normal(scale=self.scale_echo,size=(self.hid_num,self.inp_num))
+			win = np.diag(np.ones((self.hid_num)))
+			self.win.data = torch.FloatTensor(win)
+			self.win.requires_grad = False
+
+
+
 
 
 	def forward(self,x,hid):
